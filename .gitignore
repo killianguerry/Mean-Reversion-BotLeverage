@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+venv/
+.venv/
+
+# Données mises en cache automatiquement : pas besoin de les versionner,
+# elles sont retéléchargées automatiquement au besoin.
+data/*.parquet
+data/*.csv
+
+# Profils de réglages : générés par l'app elle-même (bouton export/import
+# disponible dans la barre latérale pour en garder une sauvegarde).
+data/*.json
+
+output/
+output_universe/
+.streamlit/secrets.toml
