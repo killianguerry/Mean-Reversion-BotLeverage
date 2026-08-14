@@ -25,10 +25,12 @@ import pandas as pd
 import streamlit as st
 
 from backtester import StrategyParams, run_backtest
+from fx_data import get_eurusd_series_safe
 from indicators import bollinger_bands
 from nasdaq100_data import get_universe, DEFAULT_CACHE_PATH, DEFAULT_MAX_AGE_DAYS
 from optimizer import optimize, params_from_row, METRIC_LABELS
 from portfolio import run_universe
+from portfolio_sim import PortfolioSimParams, run_portfolio_simulation
 
 st.set_page_config(page_title="Mean Reversion Bot — Haut Winrate + Levier — Nasdaq-100", layout="wide")
 
@@ -677,6 +679,111 @@ with st.expander("Rechercher automatiquement de meilleurs réglages", expanded=F
             st.session_state.profiles[profile_name] = ui_dict
             save_profiles(st.session_state.profiles)
             st.rerun()
+
+# ---------------------------------------------------------------------------
+# Section : Simulation de portefeuille réaliste (capital unique en EUR,
+# frais IBKR, conversion de change, 20 positions max à 2% de l'équity)
+# ---------------------------------------------------------------------------
+st.subheader("💶 Simulation de portefeuille réaliste (EUR, frais IBKR)")
+with st.expander(
+    "Simuler l'évolution d'un capital réel en euros (20 positions max, 2% chacune, frais IBKR)",
+    expanded=False,
+):
+    st.caption(
+        "Contrairement au tableau de bord ci-dessus (qui teste chaque action isolément avec un "
+        "capital plein, puis moyenne les résultats — pratique pour comparer les actions entre "
+        "elles, mais irréaliste pour juger une performance en argent réel), cette section simule "
+        "**un seul portefeuille partagé** : 20 positions maximum en simultané, chacune dimensionnée "
+        "à 2% de l'équity du moment, avec les frais Interactive Brokers (commissions actions US + "
+        "conversion de change EUR/USD) et les contraintes de trésorerie/capacité d'un vrai compte."
+    )
+
+    sc1, sc2, sc3 = st.columns(3)
+    sim_capital = sc1.number_input("Capital initial (€)", 1_000, 10_000_000, 100_000, step=5_000)
+    sim_max_positions = sc2.slider("Positions simultanées max", 1, 40, 20)
+    sim_position_pct = sc3.slider("Taille par position (% équity)", 0.5, 10.0, 2.0, step=0.5)
+
+    with st.expander("⚙️ Avancé : frais (par défaut = tarification IBKR Pro fixe, actions US)"):
+        fc1, fc2, fc3 = st.columns(3)
+        sim_comm_per_share = fc1.number_input("Commission par action ($)", 0.0, 0.05, 0.005, step=0.001, format="%.3f")
+        sim_comm_min = fc2.number_input("Commission min. par ordre ($)", 0.0, 10.0, 1.0, step=0.5)
+        sim_comm_max_pct = fc3.number_input("Plafond commission (% valeur ordre)", 0.1, 5.0, 1.0, step=0.1)
+        fc4, fc5 = st.columns(2)
+        sim_fx_fee_pct = fc4.number_input("Frais de change (% converti)", 0.0, 1.0, 0.03, step=0.01)
+        sim_fx_fee_min = fc5.number_input("Frais de change min. ($)", 0.0, 20.0, 2.0, step=0.5)
+        sim_fallback_rate = st.number_input("Taux EUR/USD de repli (si historique indisponible)", 0.8, 1.5, 1.08, step=0.01)
+
+    if st.button("💶 Lancer la simulation réaliste"):
+        sim_bar = st.progress(0.0, text="Initialisation...")
+        eur_usd_rate, used_live_fx = get_eurusd_series_safe(
+            period="5y", fallback_rate=sim_fallback_rate,
+        )
+        sim_params = PortfolioSimParams(
+            initial_capital_eur=float(sim_capital),
+            max_positions=sim_max_positions,
+            position_pct=sim_position_pct / 100,
+            commission_per_share_usd=sim_comm_per_share,
+            commission_min_usd=sim_comm_min,
+            commission_max_pct_of_trade=sim_comm_max_pct / 100,
+            fx_fee_pct=sim_fx_fee_pct / 100,
+            fx_fee_min_usd=sim_fx_fee_min,
+            eur_usd_fallback_rate=sim_fallback_rate,
+        )
+        try:
+            sim_result = run_portfolio_simulation(
+                per_ticker, StrategyParams(**params_dict), sim_params,
+                eur_usd_rate=eur_usd_rate, used_live_fx=used_live_fx,
+                progress_callback=lambda frac, msg: sim_bar.progress(min(frac, 1.0), text=msg),
+            )
+            st.session_state["sim_result"] = sim_result
+        except RuntimeError as exc:
+            st.error(str(exc))
+        sim_bar.empty()
+
+    if "sim_result" in st.session_state:
+        sim_result = st.session_state["sim_result"]
+        if not sim_result.used_live_fx:
+            st.warning(
+                "⚠️ L'historique EUR/USD réel n'a pas pu être téléchargé — taux constant utilisé "
+                "à la place. Moins réaliste : le taux de change bouge de plusieurs % sur la période."
+            )
+
+        m1, m2, m3, m4 = st.columns(4)
+        metric_card(m1, "Capital final", f"{sim_result.final_equity_eur:,.0f} €", tone_for(sim_result.total_return_pct))
+        metric_card(m2, "Performance totale", f"{sim_result.total_return_pct:+.1f}%", tone_for(sim_result.total_return_pct))
+        metric_card(m3, "Max drawdown", f"{sim_result.max_drawdown_pct:.1f}%", "negative")
+        metric_card(m4, "Win rate", f"{sim_result.win_rate_pct:.0f}%")
+
+        m5, m6, m7 = st.columns(3)
+        metric_card(m5, "Trades exécutés", f"{len(sim_result.closed_trades)}")
+        metric_card(m6, "Frais totaux payés", f"{sim_result.total_fees_eur:,.0f} €", "negative")
+        metric_card(
+            m7, "Signaux ignorés",
+            f"{sim_result.n_skipped_capacity + sim_result.n_skipped_cash + sim_result.n_skipped_lot}",
+        )
+        st.caption(
+            f"Détail des signaux ignorés — capacité (20 positions déjà ouvertes) : "
+            f"{sim_result.n_skipped_capacity} · trésorerie insuffisante : {sim_result.n_skipped_cash} · "
+            f"position < 1 action : {sim_result.n_skipped_lot}"
+        )
+
+        fig_sim, ax_sim = plt.subplots(figsize=(11, 3.5))
+        sim_result.equity_curve.plot(ax=ax_sim, linewidth=2, color="#2563eb")
+        ax_sim.set_ylabel("Équity (€)")
+        ax_sim.set_title("Portefeuille réaliste — capital unique en euros, net de frais", fontsize=10)
+        ax_sim.grid(alpha=0.25)
+        fig_sim.tight_layout()
+        st.pyplot(fig_sim)
+        plt.close(fig_sim)
+
+        if sim_result.closed_trades:
+            sim_trades_df = pd.DataFrame([t.__dict__ for t in sim_result.closed_trades])
+            st.dataframe(sim_trades_df, width="stretch", height=250)
+            st.download_button(
+                "⬇️ Télécharger les trades (CSV)",
+                data=sim_trades_df.to_csv(index=False).encode("utf-8"),
+                file_name="trades_simulation_realiste.csv", mime="text/csv",
+            )
 
 # ---------------------------------------------------------------------------
 # Section 2 : détail par action — un graphique entrée/sortie par action,

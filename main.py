@@ -26,6 +26,10 @@ Exemples :
 
     # Ajouter du levier (avec coût d'emprunt et liquidation simulée)
     python main.py --leverage 2 --confirm-bars 2 --rsi-daily 40
+
+    # Simulation réaliste : capital unique en EUR, frais IBKR, 20 positions
+    # max à 2% de l'équity chacune
+    python main.py --realistic-sim --capital 100000
 """
 
 from __future__ import annotations
@@ -41,9 +45,11 @@ import pandas as pd
 
 from backtester import StrategyParams, run_backtest
 from data_loader import load_csv, load_yfinance
+from fx_data import get_eurusd_series_safe, DEFAULT_CACHE_PATH as DEFAULT_FX_CACHE_PATH
 from nasdaq100_data import get_universe, DEFAULT_CACHE_PATH, DEFAULT_MAX_AGE_DAYS
 from optimizer import optimize, params_from_row, METRIC_LABELS
 from portfolio import run_universe
+from portfolio_sim import PortfolioSimParams, run_portfolio_simulation
 
 
 def parse_args():
@@ -104,6 +110,34 @@ def parse_args():
                          "perf_risk_ratio (performance/drawdown) ou win_rate.")
 
     p.add_argument("--out", type=str, default="output", help="Dossier de sortie")
+
+    p.add_argument("--realistic-sim", action="store_true",
+                    help="Lance la simulation de portefeuille réaliste (capital unique en EUR, "
+                         "frais IBKR, conversion de change, max 20 positions simultanées à 2%% "
+                         "de l'équity chacune) au lieu du mode 'moyenne par ticker' par défaut. "
+                         "Ne s'applique qu'à l'univers complet (pas --ticker ni --csv).")
+    p.add_argument("--capital", type=float, default=100_000.0,
+                    help="Capital initial en EUR (--realistic-sim)")
+    p.add_argument("--max-positions", type=int, default=20,
+                    help="Nombre maximum de positions simultanées (--realistic-sim)")
+    p.add_argument("--position-pct", type=float, default=2.0,
+                    help="Taille de chaque position, en %% de l'équity courante (--realistic-sim)")
+    p.add_argument("--commission-per-share", type=float, default=0.005,
+                    help="Commission IBKR par action en USD (--realistic-sim)")
+    p.add_argument("--commission-min", type=float, default=1.0,
+                    help="Commission minimum par ordre en USD (--realistic-sim)")
+    p.add_argument("--commission-max-pct", type=float, default=1.0,
+                    help="Plafond de commission, en %% de la valeur de l'ordre (--realistic-sim)")
+    p.add_argument("--fx-fee-pct", type=float, default=0.03,
+                    help="Frais de conversion de change, en %% du montant converti (--realistic-sim)")
+    p.add_argument("--fx-fee-min", type=float, default=2.0,
+                    help="Frais de conversion de change minimum en USD (--realistic-sim)")
+    p.add_argument("--eur-usd-rate", type=float, default=1.08,
+                    help="Taux EUR/USD de repli si l'historique n'est pas disponible (--realistic-sim)")
+    p.add_argument("--no-fx-history", action="store_true",
+                    help="N'essaie pas de télécharger l'historique EUR/USD réel, utilise "
+                         "directement le taux constant --eur-usd-rate (--realistic-sim)")
+
     return p.parse_args()
 
 
@@ -241,6 +275,81 @@ def run_full_universe(args, params: StrategyParams):
     print(f"Graphique du portefeuille : {plot_path}")
 
 
+def build_sim_params(args) -> PortfolioSimParams:
+    return PortfolioSimParams(
+        initial_capital_eur=args.capital,
+        max_positions=args.max_positions,
+        position_pct=args.position_pct / 100,
+        commission_per_share_usd=args.commission_per_share,
+        commission_min_usd=args.commission_min,
+        commission_max_pct_of_trade=args.commission_max_pct / 100,
+        fx_fee_pct=args.fx_fee_pct / 100,
+        fx_fee_min_usd=args.fx_fee_min,
+        eur_usd_fallback_rate=args.eur_usd_rate,
+    )
+
+
+def run_realistic_sim(args, params: StrategyParams):
+    print("Récupération des données Nasdaq-100 (cache automatique si disponible)...")
+    try:
+        universe = get_universe(
+            cache_path=args.data_cache,
+            max_age_days=args.max_age_days,
+            force_refresh=args.refresh_data,
+            period=args.period,
+        )
+    except RuntimeError as exc:
+        print(f"\nErreur : {exc}", file=sys.stderr)
+        sys.exit(1)
+    print(f"{len(universe)} tickers prêts.\n")
+
+    sim_params = build_sim_params(args)
+
+    eur_usd_rate, used_live_fx = None, False
+    if not args.no_fx_history:
+        print("Récupération de l'historique EUR/USD (cache automatique si disponible)...")
+        eur_usd_rate, used_live_fx = get_eurusd_series_safe(
+            period=args.period, cache_path=DEFAULT_FX_CACHE_PATH,
+            fallback_rate=args.eur_usd_rate,
+        )
+        if not used_live_fx:
+            print(f"  -> historique indisponible, taux constant {args.eur_usd_rate} utilisé.\n")
+        else:
+            print(f"  -> {len(eur_usd_rate)} points chargés.\n")
+    else:
+        used_live_fx = False
+
+    def progress(frac, msg):
+        print(f"\r[{frac * 100:5.1f}%] {msg:60s}", end="", flush=True)
+
+    result = run_portfolio_simulation(
+        universe, params, sim_params,
+        eur_usd_rate=eur_usd_rate if not args.no_fx_history else None,
+        used_live_fx=used_live_fx,
+        progress_callback=progress,
+    )
+    print("\n")
+
+    print("=== Simulation de portefeuille réaliste (capital unique, frais IBKR, EUR) ===")
+    print(result.summary())
+
+    os.makedirs(args.out, exist_ok=True)
+    trades_df = pd.DataFrame([t.__dict__ for t in result.closed_trades])
+    trades_path = os.path.join(args.out, "trades_realistic_sim.csv")
+    trades_df.to_csv(trades_path, index=False)
+    print(f"\nTrades détaillés : {trades_path}")
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+    result.equity_curve.plot(ax=ax, label="Portefeuille (capital réel)", linewidth=2, color="#2563eb")
+    ax.set_title("Simulation de portefeuille réaliste — capital unique en EUR")
+    ax.set_ylabel("Équity (€)")
+    ax.legend()
+    ax.grid(alpha=0.3)
+    plot_path = os.path.join(args.out, "portfolio_sim_equity_curve.png")
+    fig.savefig(plot_path, dpi=150, bbox_inches="tight")
+    print(f"Graphique : {plot_path}")
+
+
 def main():
     args = parse_args()
 
@@ -258,6 +367,8 @@ def main():
         df = load_yfinance(args.ticker, period=args.period)
         print(f"Données chargées ({args.ticker}) : {len(df)} bougies, de {df.index.min().date()} à {df.index.max().date()}")
         run_single(df, params, args.out, label=args.ticker)
+    elif args.realistic_sim:
+        run_realistic_sim(args, params)
     else:
         run_full_universe(args, params)
 
